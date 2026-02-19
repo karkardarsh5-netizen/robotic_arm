@@ -92,6 +92,11 @@ float moveToward(float current, float target, float maxStep) {
   return current + (delta > 0.0f ? maxStep : -maxStep);
 }
 
+float toElbowServoDeg(float elbowIkDeg) {
+  // Flip elbow servo direction at final write stage only.
+  return clampf(180.0f - elbowIkDeg, ELBOW_MIN_DEG, ELBOW_MAX_DEG);
+}
+
 // Keep target point in reachable annulus for a 2-link arm.
 // Reachable radius: |L1-L2| <= r <= (L1+L2)
 void enforceWorkspace(float &x, float &y) {
@@ -204,7 +209,7 @@ void setup() {
   }
 
   shoulderServo.write((int)round(clampf(shoulderCmdDeg, SHOULDER_MIN_DEG, SHOULDER_MAX_DEG)));
-  elbowServo.write((int)round(clampf(elbowCmdDeg, ELBOW_MIN_DEG, ELBOW_MAX_DEG)));
+  elbowServo.write((int)round(toElbowServoDeg(elbowCmdDeg)));
 
   Serial.println(F("2-DOF Y-axis joystick IK control ready."));
   lastControlMs = millis();
@@ -276,7 +281,8 @@ void loop() {
     }
 
     if (fabs(elbowCmdDeg - lastWrittenElbow) > WRITE_EPS_DEG) {
-      elbowServo.write((int)round(elbowCmdDeg));
+      float elbowServoDeg = toElbowServoDeg(elbowCmdDeg);
+      elbowServo.write((int)round(elbowServoDeg));
       lastWrittenElbow = elbowCmdDeg;
     }
   }
