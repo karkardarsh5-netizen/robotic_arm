@@ -49,9 +49,11 @@ const float X_SWEEP_SPEED_CM_S = 1.5f;  // slow auto motion along X
 int8_t xDirection = 1;
 
 // ---------------- Servo smoothing / anti-jitter ----------------
-const float MAX_SHOULDER_STEP_DEG = 1.1f; // MG996R: tighter per-tick slew limit
-const float MAX_ELBOW_STEP_DEG = 1.8f;    // lighter elbow can move a bit faster
-const float ANGLE_INTERP_RATE = 10.0f;    // interpolation speed (1/s) toward IK target
+const float MAX_SHOULDER_STEP_DEG = 1.1f; // max change per control tick
+const float MAX_ELBOW_STEP_DEG = 1.8f;    // max change per control tick
+const float TARGET_LPF_CUTOFF_HZ = 3.0f;  // low-pass filter cutoff for IK angle targets
+const float ANGLE_INTERP_RATE = 8.0f;     // interpolation speed (1/s) toward filtered target
+const float ANGLE_DEADBAND_DEG = 0.45f;   // ignore tiny angle errors to avoid chatter
 const float WRITE_EPS_DEG = 0.35f;        // do not rewrite tiny changes
 
 // Desired (commanded) end-effector position (cm)
@@ -63,6 +65,8 @@ float shoulderCmdDeg = SHOULDER_ZERO_OFFSET_DEG;
 float elbowCmdDeg = ELBOW_ZERO_OFFSET_DEG;
 float shoulderInterpDeg = SHOULDER_ZERO_OFFSET_DEG;
 float elbowInterpDeg = ELBOW_ZERO_OFFSET_DEG;
+float shoulderFilteredTargetDeg = SHOULDER_ZERO_OFFSET_DEG;
+float elbowFilteredTargetDeg = ELBOW_ZERO_OFFSET_DEG;
 
 // ---------------- Utility helpers ----------------
 float clampf(float v, float lo, float hi) {
@@ -163,6 +167,8 @@ void setup() {
     elbowCmdDeg = eDeg;
     shoulderInterpDeg = sDeg;
     elbowInterpDeg = eDeg;
+    shoulderFilteredTargetDeg = sDeg;
+    elbowFilteredTargetDeg = eDeg;
   }
 
   shoulderServo.write((int)round(clampf(shoulderCmdDeg, SHOULDER_MIN_DEG, SHOULDER_MAX_DEG)));
@@ -209,13 +215,29 @@ void loop() {
   bool ok = solveIK(targetX, targetY, shoulderTargetDeg, elbowTargetDeg);
 
   if (ok) {
-    // 4) Interpolate IK target angles first, then apply per-joint slew limits.
-    float interpAlpha = clampf(ANGLE_INTERP_RATE * dt, 0.0f, 1.0f);
-    shoulderInterpDeg += interpAlpha * (shoulderTargetDeg - shoulderInterpDeg);
-    elbowInterpDeg += interpAlpha * (elbowTargetDeg - elbowInterpDeg);
+    // 4) Low-pass filter IK targets to suppress high-frequency jitter.
+    float lpfTau = 1.0f / (2.0f * PI * TARGET_LPF_CUTOFF_HZ);
+    float lpfAlpha = clampf(dt / (lpfTau + dt), 0.0f, 1.0f);
+    shoulderFilteredTargetDeg += lpfAlpha * (shoulderTargetDeg - shoulderFilteredTargetDeg);
+    elbowFilteredTargetDeg += lpfAlpha * (elbowTargetDeg - elbowFilteredTargetDeg);
 
-    shoulderCmdDeg = moveToward(shoulderCmdDeg, shoulderInterpDeg, MAX_SHOULDER_STEP_DEG);
-    elbowCmdDeg = moveToward(elbowCmdDeg, elbowInterpDeg, MAX_ELBOW_STEP_DEG);
+    // 5) Interpolate filtered target angles, then apply per-joint slew limits.
+    float interpAlpha = clampf(ANGLE_INTERP_RATE * dt, 0.0f, 1.0f);
+    shoulderInterpDeg += interpAlpha * (shoulderFilteredTargetDeg - shoulderInterpDeg);
+    elbowInterpDeg += interpAlpha * (elbowFilteredTargetDeg - elbowInterpDeg);
+
+    // 6) Deadband suppresses tiny repeated updates around steady-state.
+    float shoulderSlewTargetDeg = shoulderInterpDeg;
+    float elbowSlewTargetDeg = elbowInterpDeg;
+    if (fabs(shoulderSlewTargetDeg - shoulderCmdDeg) < ANGLE_DEADBAND_DEG) {
+      shoulderSlewTargetDeg = shoulderCmdDeg;
+    }
+    if (fabs(elbowSlewTargetDeg - elbowCmdDeg) < ANGLE_DEADBAND_DEG) {
+      elbowSlewTargetDeg = elbowCmdDeg;
+    }
+
+    shoulderCmdDeg = moveToward(shoulderCmdDeg, shoulderSlewTargetDeg, MAX_SHOULDER_STEP_DEG);
+    elbowCmdDeg = moveToward(elbowCmdDeg, elbowSlewTargetDeg, MAX_ELBOW_STEP_DEG);
 
     shoulderCmdDeg = clampf(shoulderCmdDeg, SHOULDER_MIN_DEG, SHOULDER_MAX_DEG);
     elbowCmdDeg = clampf(elbowCmdDeg, ELBOW_MIN_DEG, ELBOW_MAX_DEG);
