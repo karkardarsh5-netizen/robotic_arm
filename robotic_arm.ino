@@ -45,8 +45,9 @@ const uint16_t CONTROL_PERIOD_MS = 20; // ~50 Hz updates (smooth for hobby servo
 unsigned long lastControlMs = 0;
 
 // ---------------- Joystick filtering / shaping ----------------
-const float JOY_ALPHA = 0.20f;          // low-pass filter strength (0..1)
-const float JOY_DEADBAND = 0.06f;       // remove small stick noise around center
+const float JOY_FILTER_CUTOFF_HZ = 4.0f; // first-order low-pass cutoff
+const float JOY_DEADBAND = 0.08f;        // remove small stick noise around center
+const float JOY_MOTION_DEADBAND = 0.02f; // suppress tiny post-deadband residual motion
 float joyXFiltered = 0.0f;
 float joyYFiltered = 0.0f;
 
@@ -54,8 +55,10 @@ float joyYFiltered = 0.0f;
 const float MAX_SPEED_CM_S = 6.0f;      // max end-effector speed from joystick
 
 // ---------------- Servo smoothing / anti-jitter ----------------
-const float MAX_SERVO_STEP_DEG = 2.0f;  // max change per control tick per joint
-const float WRITE_EPS_DEG = 0.3f;       // do not rewrite tiny changes
+const float MAX_SHOULDER_STEP_DEG = 1.1f; // MG996R: tighter per-tick slew limit
+const float MAX_ELBOW_STEP_DEG = 1.8f;    // lighter elbow can move a bit faster
+const float ANGLE_INTERP_RATE = 10.0f;    // interpolation speed (1/s) toward IK target
+const float WRITE_EPS_DEG = 0.35f;        // do not rewrite tiny changes
 
 // Desired (commanded) end-effector position (cm)
 float targetX = L1 + L2 - 2.0f; // start near full extension but safely inside boundary
@@ -64,6 +67,8 @@ float targetY = 0.0f;
 // Current commanded servo angles (deg)
 float shoulderCmdDeg = SHOULDER_ZERO_OFFSET_DEG;
 float elbowCmdDeg = ELBOW_ZERO_OFFSET_DEG;
+float shoulderInterpDeg = SHOULDER_ZERO_OFFSET_DEG;
+float elbowInterpDeg = ELBOW_ZERO_OFFSET_DEG;
 
 // ---------------- Utility helpers ----------------
 float clampf(float v, float lo, float hi) {
@@ -165,6 +170,8 @@ void setup() {
   if (solveIK(targetX, targetY, sDeg, eDeg)) {
     shoulderCmdDeg = sDeg;
     elbowCmdDeg = eDeg;
+    shoulderInterpDeg = sDeg;
+    elbowInterpDeg = eDeg;
   }
 
   shoulderServo.write((int)round(clampf(shoulderCmdDeg, SHOULDER_MIN_DEG, SHOULDER_MAX_DEG)));
@@ -183,6 +190,9 @@ void loop() {
   float dt = (now - lastControlMs) / 1000.0f;
   lastControlMs = now;
 
+  // For robust filtering and interpolation in case of occasional loop jitter.
+  dt = clampf(dt, 0.001f, 0.10f);
+
   // 1) Read joystick and normalize to [-1, +1]
   int rawX = analogRead(JOY_X_PIN);
   int rawY = analogRead(JOY_Y_PIN);
@@ -193,13 +203,20 @@ void loop() {
   joyX = clampf(joyX, -1.0f, 1.0f);
   joyY = clampf(joyY, -1.0f, 1.0f);
 
-  // 2) Low-pass filter to reduce ADC noise
-  joyXFiltered += JOY_ALPHA * (joyX - joyXFiltered);
-  joyYFiltered += JOY_ALPHA * (joyY - joyYFiltered);
+  // 2) Proper first-order low-pass filter to reduce ADC noise.
+  // alpha = dt / (tau + dt), tau = 1 / (2*pi*fc)
+  const float joyTau = 1.0f / (2.0f * PI * JOY_FILTER_CUTOFF_HZ);
+  float joyAlpha = dt / (joyTau + dt);
+  joyAlpha = clampf(joyAlpha, 0.0f, 1.0f);
+  joyXFiltered += joyAlpha * (joyX - joyXFiltered);
+  joyYFiltered += joyAlpha * (joyY - joyYFiltered);
 
   // 3) Deadband to prevent drift around center
   float joyXCmd = applyDeadband(joyXFiltered, JOY_DEADBAND);
   float joyYCmd = applyDeadband(joyYFiltered, JOY_DEADBAND);
+
+  if (fabs(joyXCmd) < JOY_MOTION_DEADBAND) joyXCmd = 0.0f;
+  if (fabs(joyYCmd) < JOY_MOTION_DEADBAND) joyYCmd = 0.0f;
 
   // 4) Integrate joystick command as Cartesian velocity
   float vx = joyXCmd * MAX_SPEED_CM_S;
@@ -216,9 +233,13 @@ void loop() {
   bool ok = solveIK(targetX, targetY, shoulderTargetDeg, elbowTargetDeg);
 
   if (ok) {
-    // 7) Smooth angle command to avoid jumps/jitter
-    shoulderCmdDeg = moveToward(shoulderCmdDeg, shoulderTargetDeg, MAX_SERVO_STEP_DEG);
-    elbowCmdDeg = moveToward(elbowCmdDeg, elbowTargetDeg, MAX_SERVO_STEP_DEG);
+    // 7) Interpolate IK target angles first, then apply per-joint slew limits.
+    float interpAlpha = clampf(ANGLE_INTERP_RATE * dt, 0.0f, 1.0f);
+    shoulderInterpDeg += interpAlpha * (shoulderTargetDeg - shoulderInterpDeg);
+    elbowInterpDeg += interpAlpha * (elbowTargetDeg - elbowInterpDeg);
+
+    shoulderCmdDeg = moveToward(shoulderCmdDeg, shoulderInterpDeg, MAX_SHOULDER_STEP_DEG);
+    elbowCmdDeg = moveToward(elbowCmdDeg, elbowInterpDeg, MAX_ELBOW_STEP_DEG);
 
     shoulderCmdDeg = clampf(shoulderCmdDeg, SHOULDER_MIN_DEG, SHOULDER_MAX_DEG);
     elbowCmdDeg = clampf(elbowCmdDeg, ELBOW_MIN_DEG, ELBOW_MAX_DEG);
