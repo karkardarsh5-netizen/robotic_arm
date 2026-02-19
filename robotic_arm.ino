@@ -5,16 +5,14 @@
   -------------------------------------------------
   - Shoulder servo: MG996R on pin 9
   - Elbow servo:    MG90S on pin 10
-  - Joystick X: A0 (ignored), Y: A1
 
   Control strategy:
-  1) Joystick Y commands end-effector velocity only along Cartesian y,
-     not direct servo angles.
-     Cartesian x is held at a fixed safe value.
+  1) End effector is commanded automatically along Cartesian x.
+     Cartesian y is held at a fixed safe value.
   2) Inverse kinematics converts (x, y) -> (shoulder, elbow angles).
   3) Movement is updated at a fixed interval using millis() (non-blocking).
-  4) Joystick input is low-pass filtered and has deadband to reduce noise.
-  5) Workspace and servo limits are enforced to prevent invalid commands.
+  4) Workspace and servo limits are enforced to prevent invalid commands.
+  5) Angle interpolation + slew limits keep motion smooth.
 */
 
 Servo shoulderServo;
@@ -23,8 +21,6 @@ Servo elbowServo;
 // ---------------- Hardware pins ----------------
 const uint8_t SHOULDER_PIN = 9;
 const uint8_t ELBOW_PIN = 10;
-const uint8_t JOY_X_PIN = A0;
-const uint8_t JOY_Y_PIN = A1;
 
 // ---------------- Arm geometry (cm) ----------------
 const float L1 = 10.0f;
@@ -45,14 +41,12 @@ const float ELBOW_ZERO_OFFSET_DEG = 0.0f;
 const uint16_t CONTROL_PERIOD_MS = 20; // ~50 Hz updates (smooth for hobby servos)
 unsigned long lastControlMs = 0;
 
-// ---------------- Joystick filtering / shaping ----------------
-const float JOY_FILTER_CUTOFF_HZ = 4.0f; // first-order low-pass cutoff
-const float JOY_DEADBAND = 0.08f;        // remove small stick noise around center
-const float JOY_MOTION_DEADBAND = 0.02f; // suppress tiny post-deadband residual motion
-float joyYFiltered = 0.0f;
-
 // ---------------- Cartesian motion tuning ----------------
-const float MAX_SPEED_CM_S = 6.0f;      // max end-effector speed from joystick
+const float FIXED_Y_CM = 10.0f;         // keep Y fixed at a safe value
+const float X_MIN_CM = -8.0f;           // safe X sweep range, inside reachable workspace
+const float X_MAX_CM = 8.0f;
+const float X_SWEEP_SPEED_CM_S = 1.5f;  // slow auto motion along X
+int8_t xDirection = 1;
 
 // ---------------- Servo smoothing / anti-jitter ----------------
 const float MAX_SHOULDER_STEP_DEG = 1.1f; // MG996R: tighter per-tick slew limit
@@ -61,9 +55,8 @@ const float ANGLE_INTERP_RATE = 10.0f;    // interpolation speed (1/s) toward IK
 const float WRITE_EPS_DEG = 0.35f;        // do not rewrite tiny changes
 
 // Desired (commanded) end-effector position (cm)
-const float FIXED_X_CM = 10.0f;
-float targetX = FIXED_X_CM;
-float targetY = 0.0f;
+float targetX = 0.0f;
+float targetY = FIXED_Y_CM;
 
 // Current commanded servo angles (deg)
 float shoulderCmdDeg = SHOULDER_ZERO_OFFSET_DEG;
@@ -76,14 +69,6 @@ float clampf(float v, float lo, float hi) {
   if (v < lo) return lo;
   if (v > hi) return hi;
   return v;
-}
-
-float applyDeadband(float v, float deadband) {
-  if (fabs(v) < deadband) return 0.0f;
-
-  // Re-scale so output remains continuous after deadband.
-  if (v > 0.0f) return (v - deadband) / (1.0f - deadband);
-  return (v + deadband) / (1.0f - deadband);
 }
 
 float moveToward(float current, float target, float maxStep) {
@@ -118,34 +103,6 @@ void enforceWorkspace(float &x, float &y) {
     float s = rMax / r;
     x *= s;
     y *= s;
-  }
-}
-
-// Keep target Y in reachable workspace while holding X fixed.
-void enforceWorkspaceFixedX(float fixedX, float &y) {
-  float x = fixedX;
-  enforceWorkspace(x, y);
-
-  const float absX = fabs(fixedX);
-  const float rMin = fabs(L1 - L2) + 0.5f;
-  const float rMax = (L1 + L2) - 0.5f;
-
-  // Limit by outer radius first: x^2 + y^2 <= rMax^2
-  float maxAbsY = 0.0f;
-  float maxAbsYSq = rMax * rMax - fixedX * fixedX;
-  if (maxAbsYSq > 0.0f) {
-    maxAbsY = sqrt(maxAbsYSq);
-  }
-  y = clampf(y, -maxAbsY, maxAbsY);
-
-  // If |x| < rMin, enforce inner radius: x^2 + y^2 >= rMin^2
-  if (absX < rMin) {
-    float minAbsYSq = rMin * rMin - fixedX * fixedX;
-    float minAbsY = (minAbsYSq > 0.0f) ? sqrt(minAbsYSq) : 0.0f;
-
-    if (fabs(y) < minAbsY) {
-      y = (y >= 0.0f) ? minAbsY : -minAbsY;
-    }
   }
 }
 
@@ -211,7 +168,7 @@ void setup() {
   shoulderServo.write((int)round(clampf(shoulderCmdDeg, SHOULDER_MIN_DEG, SHOULDER_MAX_DEG)));
   elbowServo.write((int)round(toElbowServoDeg(elbowCmdDeg)));
 
-  Serial.println(F("2-DOF Y-axis joystick IK control ready."));
+  Serial.println(F("2-DOF X-axis auto-sweep IK control ready."));
   lastControlMs = millis();
 }
 
@@ -227,41 +184,32 @@ void loop() {
   // For robust filtering and interpolation in case of occasional loop jitter.
   dt = clampf(dt, 0.001f, 0.10f);
 
-  // 1) Read joystick and normalize to [-1, +1]
-  int rawY = analogRead(JOY_Y_PIN);
+  // 1) Auto-sweep X back and forth; hold Y constant.
+  targetY = FIXED_Y_CM;
+  targetX += xDirection * X_SWEEP_SPEED_CM_S * dt;
 
-  float joyY = ((float)rawY - 512.0f) / 512.0f;
+  if (targetX >= X_MAX_CM) {
+    targetX = X_MAX_CM;
+    xDirection = -1;
+  } else if (targetX <= X_MIN_CM) {
+    targetX = X_MIN_CM;
+    xDirection = 1;
+  }
 
-  joyY = clampf(joyY, -1.0f, 1.0f);
+  // 2) Workspace safety clamp for the full (x, y) point.
+  enforceWorkspace(targetX, targetY);
 
-  // 2) Proper first-order low-pass filter to reduce ADC noise.
-  // alpha = dt / (tau + dt), tau = 1 / (2*pi*fc)
-  const float joyTau = 1.0f / (2.0f * PI * JOY_FILTER_CUTOFF_HZ);
-  float joyAlpha = dt / (joyTau + dt);
-  joyAlpha = clampf(joyAlpha, 0.0f, 1.0f);
-  joyYFiltered += joyAlpha * (joyY - joyYFiltered);
+  // Keep Y fixed after workspace enforcement while still bounding X to requested range.
+  targetY = FIXED_Y_CM;
+  targetX = clampf(targetX, X_MIN_CM, X_MAX_CM);
 
-  // 3) Deadband to prevent drift around center
-  float joyYCmd = applyDeadband(joyYFiltered, JOY_DEADBAND);
-
-  if (fabs(joyYCmd) < JOY_MOTION_DEADBAND) joyYCmd = 0.0f;
-
-  // 4) Integrate joystick Y command as Cartesian velocity (X is fixed)
-  float vy = joyYCmd * MAX_SPEED_CM_S;
-  targetX = FIXED_X_CM;
-  targetY += vy * dt;
-
-  // 5) Keep target inside reachable workspace while holding X fixed
-  enforceWorkspaceFixedX(FIXED_X_CM, targetY);
-  targetX = FIXED_X_CM;
-
-  // 6) IK solve for target angles
+  // 3) IK solve for target angles
   float shoulderTargetDeg = shoulderCmdDeg;
   float elbowTargetDeg = elbowCmdDeg;
   bool ok = solveIK(targetX, targetY, shoulderTargetDeg, elbowTargetDeg);
 
   if (ok) {
-    // 7) Interpolate IK target angles first, then apply per-joint slew limits.
+    // 4) Interpolate IK target angles first, then apply per-joint slew limits.
     float interpAlpha = clampf(ANGLE_INTERP_RATE * dt, 0.0f, 1.0f);
     shoulderInterpDeg += interpAlpha * (shoulderTargetDeg - shoulderInterpDeg);
     elbowInterpDeg += interpAlpha * (elbowTargetDeg - elbowInterpDeg);
