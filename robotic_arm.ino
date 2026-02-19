@@ -38,7 +38,7 @@ const float SHOULDER_ZERO_OFFSET_DEG = 90.0f;
 const float ELBOW_ZERO_OFFSET_DEG = 0.0f;
 
 // ---------------- Control timing ----------------
-const uint16_t CONTROL_PERIOD_MS = 20; // ~50 Hz updates (smooth for hobby servos)
+const uint16_t CONTROL_PERIOD_MS = 10; // ~100 Hz updates for faster, smoother response
 unsigned long lastControlMs = 0;
 
 // ---------------- Cartesian motion tuning ----------------
@@ -49,12 +49,12 @@ const float X_SWEEP_SPEED_CM_S = 1.5f;  // slow auto motion along X
 int8_t xDirection = 1;
 
 // ---------------- Servo smoothing / anti-jitter ----------------
-const float MAX_SHOULDER_STEP_DEG = 1.1f; // max change per control tick
-const float MAX_ELBOW_STEP_DEG = 1.8f;    // max change per control tick
+const float MAX_SHOULDER_STEP_DEG = 1.2f; // max change per control tick (1-2 deg/cycle)
+const float MAX_ELBOW_STEP_DEG = 1.6f;    // max change per control tick (1-2 deg/cycle)
 const float TARGET_LPF_CUTOFF_HZ = 3.0f;  // low-pass filter cutoff for IK angle targets
-const float ANGLE_INTERP_RATE = 8.0f;     // interpolation speed (1/s) toward filtered target
-const float ANGLE_DEADBAND_DEG = 0.45f;   // ignore tiny angle errors to avoid chatter
-const float WRITE_EPS_DEG = 0.35f;        // do not rewrite tiny changes
+const float ANGLE_INTERP_RATE = 12.0f;    // interpolation speed (1/s) toward filtered target
+const float ANGLE_DEADBAND_DEG = 0.20f;   // ignore tiny angle errors to avoid chatter
+const float WRITE_EPS_DEG = 0.20f;        // do not rewrite tiny changes
 
 // Desired (commanded) end-effector position (cm)
 float targetX = 0.0f;
@@ -260,7 +260,7 @@ void loop() {
   // Optional lightweight telemetry at ~10 Hz
   static uint8_t debugDivider = 0;
   debugDivider++;
-  if (debugDivider >= 5) {
+  if (debugDivider >= 10) {
     debugDivider = 0;
     Serial.print(F("X:")); Serial.print(targetX, 2);
     Serial.print(F(" Y:")); Serial.print(targetY, 2);
